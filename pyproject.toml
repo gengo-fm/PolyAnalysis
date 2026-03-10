@@ -1,0 +1,17 @@
+[project]
+name = "polycopilot"
+version = "0.1.0"
+description = "Polymarket 钱包量化分析与跟单评分系统"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "plotly>=5.18",
+    "streamlit>=1.30",
+    "tenacity>=8.2",
+    "loguru>=0.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff"]
