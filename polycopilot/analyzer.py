@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -24,6 +25,27 @@ import pandas as pd
 from loguru import logger
 
 from polycopilot.processor import MarketReport
+
+
+# ═══════════════════════════════════════════════════════════
+# 行为画像阈值配置
+# ═══════════════════════════════════════════════════════════
+
+@dataclass
+class BehaviorProfileConfig:
+    """行为画像阈值配置。所有值为初始启发式值，可根据真实样本校准。"""
+
+    # 执行路径标签
+    MIN_TRADES_FOR_TAGGING: int = 3          # 低于此笔数不生成路径标签
+    CLUSTERED_STD_THRESHOLD: float = 0.03    # 价格 std < 此值判定为 clustered_prices
+    PATH_SLOPE_THRESHOLD: float = 0.001      # |slope| > 此值判定为有方向性
+    HALF_PRICE_DIFF_THRESHOLD: float = 0.02  # 前后半程均价差 > 此值作为辅助确认
+
+    # 交易频率
+    FREQUENCY_WINDOWS: tuple[int, ...] = (7, 15, 30)
+
+    # verbose 输出
+    MAX_TRADES_IN_DETAIL: int = 200          # verbose 模式下单事件最多输出的逐笔数
 
 
 # ═══════════════════════════════════════════════════════════
@@ -39,11 +61,13 @@ class WalletAnalyzer:
         address: str = "",
         raw_activity: pd.DataFrame | None = None,
         freq_check: dict | None = None,
+        profile_config: BehaviorProfileConfig | None = None,
     ):
         self._reports = reports
         self._address = address
         self._raw_activity = raw_activity  # 用于 validate()
         self._freq_check = freq_check  # 高频预检结果
+        self._cfg = profile_config or BehaviorProfileConfig()
         self._closed = [r for r in reports if r.status == "Closed"]
         self._open = [r for r in reports if r.status == "Open"]
         self._events: list[dict] | None = None  # lazy
@@ -380,6 +404,269 @@ class WalletAnalyzer:
             "verdict": verdict,
         }
 
+    # ── 3.5 事件级交易摘要 ─────────────────────────────────
+
+    def analyze_event_trades(self, verbose: bool = False) -> dict:
+        """
+        事件级交易摘要 + 执行路径标签。
+
+        数据来源: self._raw_activity 按 eventSlug 分组。
+        默认输出 summary；verbose=True 时额外输出逐笔明细。
+        所有标签为启发式描述标签，不代表真实策略意图。
+        """
+        result: dict = {
+            "event_trade_summary": [],
+            "labeling_assumptions": {
+                "method": "heuristic_descriptive_labels",
+                "disclaimer": "标签基于价格统计特征的启发式判定，不代表真实策略意图。",
+                "thresholds": {
+                    "MIN_TRADES_FOR_TAGGING": self._cfg.MIN_TRADES_FOR_TAGGING,
+                    "CLUSTERED_STD_THRESHOLD": self._cfg.CLUSTERED_STD_THRESHOLD,
+                    "PATH_SLOPE_THRESHOLD": self._cfg.PATH_SLOPE_THRESHOLD,
+                    "HALF_PRICE_DIFF_THRESHOLD": self._cfg.HALF_PRICE_DIFF_THRESHOLD,
+                },
+            },
+        }
+        if verbose:
+            result["event_trade_details"] = {"enabled": True, "items": []}
+
+        if self._raw_activity is None or self._raw_activity.empty:
+            return result
+
+        df = self._raw_activity.copy()
+        if "type" in df.columns:
+            df = df[df["type"] == "TRADE"]
+        if df.empty:
+            return result
+
+        # 确保数值列
+        for col in ("price", "usdcSize", "size"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "timestamp" in df.columns:
+            df["_ts"] = pd.to_numeric(df["timestamp"], errors="coerce")
+
+        # 构建 event_slug 查找表
+        event_title_map: dict[str, str] = {}
+        for ev in (self.events or []):
+            slug = ev.get("event_slug", "")
+            if slug:
+                event_title_map[slug] = ev.get("event_title", slug)
+
+        # 按 eventSlug 分组
+        slug_col = "eventSlug" if "eventSlug" in df.columns else None
+        if slug_col is None:
+            return result
+
+        summaries = []
+        details_items = []
+
+        for slug, gdf in df.groupby(slug_col):
+            if not slug or pd.isna(slug):
+                continue
+
+            buys = gdf[gdf.get("side", pd.Series()) == "BUY"] if "side" in gdf.columns else pd.DataFrame()
+            sells = gdf[gdf.get("side", pd.Series()) == "SELL"] if "side" in gdf.columns else pd.DataFrame()
+
+            buy_count = len(buys)
+            sell_count = len(sells)
+
+            # VWAP 计算
+            def _vwap(sub: pd.DataFrame) -> float | None:
+                if sub.empty:
+                    return None
+                usdc = sub["usdcSize"].dropna()
+                sz = sub["size"].dropna()
+                valid = usdc.index.intersection(sz.index)
+                usdc_v, sz_v = usdc.loc[valid], sz.loc[valid]
+                sz_sum = sz_v.sum()
+                if sz_sum <= 0:
+                    return None
+                return float(usdc_v.sum() / sz_sum)
+
+            def _simple_mean(sub: pd.DataFrame) -> float | None:
+                if sub.empty or "price" not in sub.columns:
+                    return None
+                p = sub["price"].dropna()
+                return float(p.mean()) if len(p) > 0 else None
+
+            def _price_stats(sub: pd.DataFrame) -> dict | None:
+                if sub.empty or "price" not in sub.columns:
+                    return None
+                p = sub["price"].dropna()
+                if len(p) == 0:
+                    return None
+                mn, mx = float(p.min()), float(p.max())
+                std = float(p.std()) if len(p) > 1 else 0.0
+                mean_p = float(p.mean())
+                cv = round(std / mean_p, 4) if mean_p > 0 else None
+                return {
+                    "min": round(mn, 4),
+                    "max": round(mx, 4),
+                    "range": round(mx - mn, 4),
+                    "std": round(std, 4),
+                    "cv": cv,
+                }
+
+            buy_vwap = _vwap(buys)
+            sell_vwap = _vwap(sells)
+            buy_simple_mean = _simple_mean(buys)
+            sell_simple_mean = _simple_mean(sells)
+            buy_price_stats = _price_stats(buys)
+            sell_price_stats = _price_stats(sells)
+            buy_total_usdc = round(float(buys["usdcSize"].sum()), 2) if not buys.empty and "usdcSize" in buys.columns else 0
+            sell_total_usdc = round(float(sells["usdcSize"].sum()), 2) if not sells.empty and "usdcSize" in sells.columns else 0
+
+            # ── 执行路径标签 ──
+            exec_path = self._compute_execution_path(buys, buy_count)
+
+            summary = {
+                "event_slug": str(slug),
+                "event_title": event_title_map.get(str(slug), str(slug)),
+                "buy_count": buy_count,
+                "sell_count": sell_count,
+                "buy_vwap": round(buy_vwap, 4) if buy_vwap is not None else None,
+                "sell_vwap": round(sell_vwap, 4) if sell_vwap is not None else None,
+                "buy_simple_mean": round(buy_simple_mean, 4) if buy_simple_mean is not None else None,
+                "sell_simple_mean": round(sell_simple_mean, 4) if sell_simple_mean is not None else None,
+                "buy_price_stats": buy_price_stats,
+                "sell_price_stats": sell_price_stats,
+                "buy_total_usdc": buy_total_usdc,
+                "sell_total_usdc": sell_total_usdc,
+                "execution_path": exec_path,
+            }
+
+            if buy_count == 0 and sell_count == 0:
+                summary["note"] = "no_activity_data"
+
+            summaries.append(summary)
+
+            # verbose 逐笔明细
+            if verbose:
+                trades_list = []
+                sub = gdf.sort_values("_ts") if "_ts" in gdf.columns else gdf
+                for _, row in sub.head(self._cfg.MAX_TRADES_IN_DETAIL).iterrows():
+                    trades_list.append({
+                        "time": str(pd.to_datetime(row.get("_ts", 0), unit="s", utc=True)) if "_ts" in row.index else None,
+                        "side": row.get("side", ""),
+                        "price": round(float(row.get("price", 0)), 4) if pd.notna(row.get("price")) else None,
+                        "usdc": round(float(row.get("usdcSize", 0)), 2) if pd.notna(row.get("usdcSize")) else None,
+                        "shares": round(float(row.get("size", 0)), 2) if pd.notna(row.get("size")) else None,
+                    })
+                details_items.append({
+                    "event_slug": str(slug),
+                    "total_trades": len(gdf),
+                    "shown": len(trades_list),
+                    "truncated": len(gdf) > self._cfg.MAX_TRADES_IN_DETAIL,
+                    "trades": trades_list,
+                })
+
+        # 按 buy_total_usdc 降序排列
+        summaries.sort(key=lambda x: x.get("buy_total_usdc", 0), reverse=True)
+        result["event_trade_summary"] = summaries
+
+        if verbose:
+            result["event_trade_details"]["items"] = details_items
+
+        return result
+
+    def _compute_execution_path(self, buys: pd.DataFrame, buy_count: int) -> dict:
+        """
+        基于买入价格统计特征生成执行路径标签。
+
+        多维交叉验证：trade_count, std, slope, half_avg_diff, VWAP vs simple_mean。
+        """
+        TAG_MAP = {
+            "single_shot": "单次建仓",
+            "few_trades": "少量交易（不做路径判定）",
+            "clustered_prices": "价格集中建仓",
+            "upward_price_path": "买入价格整体上移",
+            "downward_price_path": "买入价格整体下移",
+            "multi_level_entries": "多价位分批建仓",
+            "mixed_path": "无明显路径",
+            "no_buy_data": "无买入数据",
+        }
+
+        if buy_count == 0 or buys.empty:
+            return {"tag": "no_buy_data", "tag_cn": TAG_MAP["no_buy_data"], "confidence": "n/a", "features": {}}
+
+        if buy_count == 1:
+            return {"tag": "single_shot", "tag_cn": TAG_MAP["single_shot"], "confidence": "high", "features": {"buy_count": 1}}
+
+        if buy_count < self._cfg.MIN_TRADES_FOR_TAGGING:
+            return {"tag": "few_trades", "tag_cn": TAG_MAP["few_trades"], "confidence": "n/a", "features": {"buy_count": buy_count}}
+
+        prices = buys["price"].dropna()
+        if len(prices) < 2:
+            return {"tag": "few_trades", "tag_cn": TAG_MAP["few_trades"], "confidence": "low", "features": {"buy_count": buy_count}}
+
+        prices_arr = prices.values.astype(float)
+        std = float(np.std(prices_arr))
+        mean_p = float(np.mean(prices_arr))
+
+        # 时间排序后的 slope
+        if "_ts" in buys.columns:
+            sorted_buys = buys.sort_values("_ts")
+            sorted_prices = sorted_buys["price"].dropna().values.astype(float)
+        else:
+            sorted_prices = prices_arr
+
+        n = len(sorted_prices)
+        x = np.arange(n, dtype=float)
+        if n >= 2:
+            slope = float(np.polyfit(x, sorted_prices, 1)[0])
+        else:
+            slope = 0.0
+
+        # 前后半程均价
+        half = n // 2
+        first_half_avg = float(np.mean(sorted_prices[:half])) if half > 0 else mean_p
+        second_half_avg = float(np.mean(sorted_prices[half:])) if half > 0 else mean_p
+        half_diff = second_half_avg - first_half_avg
+
+        features = {
+            "buy_count": buy_count,
+            "price_std": round(std, 4),
+            "price_mean": round(mean_p, 4),
+            "slope": round(slope, 6),
+            "first_half_avg": round(first_half_avg, 4),
+            "second_half_avg": round(second_half_avg, 4),
+            "half_price_diff": round(half_diff, 4),
+        }
+
+        # 判定逻辑
+        cfg = self._cfg
+        if std < cfg.CLUSTERED_STD_THRESHOLD:
+            tag = "clustered_prices"
+        elif slope > cfg.PATH_SLOPE_THRESHOLD and half_diff > cfg.HALF_PRICE_DIFF_THRESHOLD:
+            tag = "upward_price_path"
+        elif slope < -cfg.PATH_SLOPE_THRESHOLD and half_diff < -cfg.HALF_PRICE_DIFF_THRESHOLD:
+            tag = "downward_price_path"
+        elif std >= cfg.CLUSTERED_STD_THRESHOLD:
+            tag = "multi_level_entries"
+        else:
+            tag = "mixed_path"
+
+        # confidence
+        slope_dir = "up" if slope > cfg.PATH_SLOPE_THRESHOLD else ("down" if slope < -cfg.PATH_SLOPE_THRESHOLD else "flat")
+        half_dir = "up" if half_diff > cfg.HALF_PRICE_DIFF_THRESHOLD else ("down" if half_diff < -cfg.HALF_PRICE_DIFF_THRESHOLD else "flat")
+        direction_consistent = (slope_dir == half_dir) or slope_dir == "flat" or half_dir == "flat"
+
+        if direction_consistent and buy_count >= 5:
+            confidence = "high"
+        elif direction_consistent:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        return {
+            "tag": tag,
+            "tag_cn": TAG_MAP.get(tag, tag),
+            "confidence": confidence,
+            "features": features,
+            "note": "启发式描述标签，不代表真实策略意图。",
+        }
+
     # ── 4. 交易行为深度分析 ────────────────────────────────
 
     def analyze_behavior(self) -> dict:
@@ -515,6 +802,9 @@ class WalletAnalyzer:
         # 检测做市商 / 高频 / 快进快出 地址
         holding_risk = self._analyze_holding_risk(closed, hours)
 
+        # ── 交易频率统计 ──
+        trading_frequency = self._compute_trading_frequency()
+
         return {
             "strategy_type": strategy,
             "total_trades": total_trades,
@@ -522,6 +812,7 @@ class WalletAnalyzer:
             "total_sells": total_sells,
             "holding_time_stats": holding_stats,
             "holding_risk": holding_risk,
+            "trading_frequency": trading_frequency,
             "position_distribution": position_dist,
             "win_loss_comparison": win_loss_comp,
             "capital_concentration": capital_concentration,
@@ -534,6 +825,90 @@ class WalletAnalyzer:
                 "simple_std_roi": round(float(np.std(rois)), 2),
             },
             "entry_price_distribution": entry_price_dist,
+        }
+
+    # ── 4.5a 交易频率统计 ──────────────────────────────────
+
+    def _compute_trading_frequency(self) -> dict:
+        """
+        计算 7/15/30 天交易频率 + 活跃期统计。
+
+        数据来源: self._raw_activity 中 type == "TRADE" 的记录。
+        笔数可能受拆单逻辑影响，因此金额维度是必要辅助口径。
+        """
+        empty = {
+            "windows": {},
+            "active_period_stats": {},
+            "note": "交易笔数可能受拆单逻辑影响，金额维度为必要辅助口径。",
+        }
+
+        if self._raw_activity is None or self._raw_activity.empty:
+            return empty
+
+        df = self._raw_activity.copy()
+        if "type" in df.columns:
+            df = df[df["type"] == "TRADE"]
+        if df.empty:
+            return empty
+
+        # 确保时间列
+        if "timestamp" in df.columns:
+            df["_ts"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df["_dt"] = pd.to_datetime(df["_ts"], unit="s", utc=True, errors="coerce")
+        else:
+            return empty
+
+        df = df.dropna(subset=["_dt"])
+        if df.empty:
+            return empty
+
+        df["_usdc"] = pd.to_numeric(df.get("usdcSize", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        df["_side"] = df.get("side", "")
+
+        now = pd.Timestamp.now(tz=timezone.utc)
+
+        # ── 窗口统计 ──
+        windows = {}
+        for w in self._cfg.FREQUENCY_WINDOWS:
+            cutoff = now - pd.Timedelta(days=w)
+            wdf = df[df["_dt"] >= cutoff]
+            total = len(wdf)
+            buys = int((wdf["_side"] == "BUY").sum())
+            sells = int((wdf["_side"] == "SELL").sum())
+            total_usdc = float(wdf["_usdc"].sum())
+            windows[f"recent_{w}d"] = {
+                "total_trades": total,
+                "buys": buys,
+                "sells": sells,
+                "trades_per_day": round(total / w, 2),
+                "buys_per_day": round(buys / w, 2),
+                "sells_per_day": round(sells / w, 2),
+                "total_usdc": round(total_usdc, 2),
+                "usdc_per_day": round(total_usdc / w, 2),
+            }
+
+        # ── 活跃期统计 ──
+        min_dt = df["_dt"].min()
+        max_dt = df["_dt"].max()
+        total_days_span = max((max_dt - min_dt).total_seconds() / 86400, 1)
+        active_days_set = df["_dt"].dt.date.nunique()
+        total_trades = len(df)
+        total_usdc = float(df["_usdc"].sum())
+
+        active_period = {
+            "first_trade": str(min_dt.date()),
+            "last_trade": str(max_dt.date()),
+            "active_days": int(active_days_set),
+            "total_days_span": round(total_days_span, 1),
+            "trading_days_ratio": round(active_days_set / total_days_span, 3) if total_days_span > 0 else 0,
+            "trades_per_active_day": round(total_trades / active_days_set, 2) if active_days_set > 0 else 0,
+            "usdc_per_active_day": round(total_usdc / active_days_set, 2) if active_days_set > 0 else 0,
+        }
+
+        return {
+            "windows": windows,
+            "active_period_stats": active_period,
+            "note": "交易笔数可能受拆单逻辑影响，金额维度为必要辅助口径。",
         }
 
     # ── 4.5 持仓时间风险分析 ─────────────────────────────
@@ -1044,7 +1419,7 @@ class WalletAnalyzer:
 
     # ── 7. 报告生成 ───────────────────────────────────────
 
-    def generate_report(self) -> dict:
+    def generate_report(self, verbose: bool = False) -> dict:
         """生成完整 JSON 报告（双口径：outcome 级 + event 级）。"""
         closed = self._closed
         events = self.events
@@ -1102,10 +1477,19 @@ class WalletAnalyzer:
             "pressure_test": self.analyze_pressure(),
             "behavior": self.analyze_behavior(),
             "conviction_analysis": self.analyze_conviction(),
-            "events": [{k: v for k, v in e.items() if k != "outcomes"} for e in events],
-            "copy_trading_score": self.calculate_score(),
-            "validation": self.validate(),
         }
+
+        # ── 事件级交易摘要 + 标签 ──
+        event_trades = self.analyze_event_trades(verbose=verbose)
+        report["event_trade_summary"] = event_trades.get("event_trade_summary", [])
+        report["labeling_assumptions"] = event_trades.get("labeling_assumptions", {})
+        if verbose and "event_trade_details" in event_trades:
+            report["event_trade_details"] = event_trades["event_trade_details"]
+
+        # ── 后续字段 ──
+        report["events"] = [{k: v for k, v in e.items() if k != "outcomes"} for e in events]
+        report["copy_trading_score"] = self.calculate_score()
+        report["validation"] = self.validate()
 
         # 高频预检信息
         if self._freq_check and self._freq_check.get("is_high_freq"):
@@ -1131,8 +1515,8 @@ class WalletAnalyzer:
         )
         return report
 
-    def save_report(self, output_dir: str = "data") -> Path:
-        report = self.generate_report()
+    def save_report(self, output_dir: str = "data", verbose: bool = False) -> Path:
+        report = self.generate_report(verbose=verbose)
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         short = self._address[:10] if self._address else "unknown"

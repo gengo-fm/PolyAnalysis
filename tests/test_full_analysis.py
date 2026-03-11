@@ -275,6 +275,57 @@ async def main():
             print(f"    {b['range']:10s} | {b['count']:>5d} | {b['win_rate_pct']:>5.1f}% | {b['avg_roi_pct']:>+7.1f}% | ${b['total_pnl']:>+11,.2f}")
 
     # ══════════════════════════════════════════════════════
+    # 10.5 交易频率统计
+    # ══════════════════════════════════════════════════════
+    tf = bh.get("trading_frequency", {})
+    if tf and tf.get("windows"):
+        print(f"\n{SEP}")
+        print(f"  交易频率统计")
+        print(SEP)
+
+        print(f"  {'窗口':10s} | {'总笔数':>7s} | {'日均':>6s} | {'日均BUY':>7s} | {'日均SELL':>8s} | {'总USDC':>14s} | {'日均USDC':>12s}")
+        print(f"  {'─'*10} | {'─'*7} | {'─'*6} | {'─'*7} | {'─'*8} | {'─'*14} | {'─'*12}")
+        for key in sorted(tf["windows"].keys()):
+            w = tf["windows"][key]
+            print(f"  {key:10s} | {w['total_trades']:>7d} | {w['trades_per_day']:>6.1f} | {w['buys_per_day']:>7.1f} | {w['sells_per_day']:>8.1f} | ${w['total_usdc']:>13,.0f} | ${w['usdc_per_day']:>11,.0f}")
+
+        ap = tf.get("active_period_stats", {})
+        if ap:
+            print(f"\n  活跃期统计:")
+            print(f"    首笔: {ap.get('first_trade', 'N/A')} | 末笔: {ap.get('last_trade', 'N/A')}")
+            print(f"    活跃天数: {ap.get('active_days', 0)} / {ap.get('total_days_span', 0):.0f} 天 (交易日占比: {ap.get('trading_days_ratio', 0)*100:.1f}%)")
+            print(f"    活跃日均交易: {ap.get('trades_per_active_day', 0):.1f} 笔 | 活跃日均金额: ${ap.get('usdc_per_active_day', 0):>,.0f}")
+
+        if tf.get("note"):
+            print(f"\n  ⚠️ {tf['note']}")
+
+    # ══════════════════════════════════════════════════════
+    # 10.6 事件级交易摘要
+    # ══════════════════════════════════════════════════════
+    ets = report.get("event_trade_summary", [])
+    if ets:
+        print(f"\n{SEP}")
+        print(f"  事件级交易摘要 (Top 15 by 投入金额)")
+        print(SEP)
+
+        print(f"  {'事件':35s} | {'BUY':>4s} | {'SELL':>4s} | {'BUY VWAP':>9s} | {'SELL VWAP':>10s} | {'价格std':>8s} | {'执行路径':12s}")
+        print(f"  {'─'*35} | {'─'*4} | {'─'*4} | {'─'*9} | {'─'*10} | {'─'*8} | {'─'*12}")
+        for s in ets[:15]:
+            title = s.get("event_title", s.get("event_slug", ""))[:35]
+            bv = f"{s['buy_vwap']:.4f}" if s.get("buy_vwap") is not None else "N/A"
+            sv = f"{s['sell_vwap']:.4f}" if s.get("sell_vwap") is not None else "N/A"
+            bps = s.get("buy_price_stats") or {}
+            std_str = f"{bps['std']:.4f}" if bps.get("std") is not None else "N/A"
+            ep = s.get("execution_path", {})
+            tag_cn = ep.get("tag_cn", "N/A")[:12]
+            print(f"  {title:35s} | {s['buy_count']:>4d} | {s['sell_count']:>4d} | {bv:>9s} | {sv:>10s} | {std_str:>8s} | {tag_cn:12s}")
+
+        # 标签方法论声明
+        la = report.get("labeling_assumptions", {})
+        if la:
+            print(f"\n  ℹ️ {la.get('disclaimer', '')}")
+
+    # ══════════════════════════════════════════════════════
     # 10.5 信心加权分析
     # ══════════════════════════════════════════════════════
     conv = report.get("conviction_analysis", {})
