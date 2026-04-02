@@ -62,6 +62,10 @@ class WalletAnalyzer:
         raw_activity: pd.DataFrame | None = None,
         freq_check: dict | None = None,
         profile_config: BehaviorProfileConfig | None = None,
+        # TradeFox 跟单参数
+        copy_delay_seconds: float = 0.3,  # 跟单延迟，默认 0.3s (TradeFox)
+        min_market_liquidity: float = 10000,  # 最小市场流动性要求
+        max_slippage_pct: float = 1.0,  # 最大滑点容忍
     ):
         self._reports = reports
         self._address = address
@@ -71,6 +75,11 @@ class WalletAnalyzer:
         self._closed = [r for r in reports if r.status == "Closed"]
         self._open = [r for r in reports if r.status == "Open"]
         self._events: list[dict] | None = None  # lazy
+        
+        # TradeFox 跟单参数
+        self._copy_delay = copy_delay_seconds
+        self._min_liquidity = min_market_liquidity
+        self._max_slippage = max_slippage_pct
 
     # ── 0. Event 级聚合 ───────────────────────────────────
 
@@ -1225,12 +1234,308 @@ class WalletAnalyzer:
 
         return checks
 
+    # ── 6a. 做市商 / 高频交易检测 ────────────────────────
+
+    def detect_market_maker(self) -> dict:
+        """
+        从 activity 数据计算做市商概率分数 (MM Score 0-100)。
+
+        5 个指标加权:
+          - PnL/Vol 比率 (30%)
+          - 交易频率 (25%)
+          - 买卖平衡度 (20%)
+          - 平均持仓时间 (15%)
+          - 金额均匀度 (10%)
+
+        返回:
+          {
+            "mm_score": float,
+            "is_market_maker": bool,       # mm_score > 50
+            "indicators": { ... },
+            "scores": { ... },
+          }
+        """
+        closed = self._closed
+        all_reports = self._reports
+
+        # ── 基础数据 ──
+        total_pnl = sum(r.realized_pnl for r in closed)
+        total_invested = sum(r.total_invested for r in closed)
+        total_trade_count = sum(r.trade_count for r in all_reports)
+        total_buy = sum(r.buy_count for r in all_reports)
+        total_sell = sum(r.sell_count for r in all_reports)
+
+        # Volume: 用 total_invested 作为近似 (买入总额)
+        # 更准确的 volume 应该是 buy + sell 金额，但 total_invested 是我们有的最好数据
+        volume = total_invested
+
+        # 活跃天数
+        all_first = [r.first_trade for r in all_reports if r.first_trade is not None]
+        all_last = [r.last_trade for r in all_reports if r.last_trade is not None]
+        if all_first and all_last:
+            active_days = max((max(all_last) - min(all_first)).days, 1)
+        else:
+            active_days = 1
+
+        # 持仓时间
+        valid_hours = [r.holding_hours for r in closed if r.holding_hours > 0]
+        avg_holding_hours = float(np.median(valid_hours)) if valid_hours else 0
+
+        # 金额均匀度 (变异系数)
+        trade_amounts = [r.total_invested for r in all_reports if r.total_invested > 0]
+        if len(trade_amounts) >= 2:
+            amount_cv = float(np.std(trade_amounts) / np.mean(trade_amounts))
+        else:
+            amount_cv = 1.0  # 样本不足，假设不均匀
+
+        # ── 指标 1: PnL/Vol 比率得分 (0-100, 权重 30%) ──
+        pnl_vol_ratio = abs(total_pnl) / volume if volume > 0 else 1.0
+        if pnl_vol_ratio < 0.001:
+            s_pnl_vol = 100
+        elif pnl_vol_ratio < 0.005:
+            s_pnl_vol = 80
+        elif pnl_vol_ratio < 0.01:
+            s_pnl_vol = 60
+        elif pnl_vol_ratio < 0.03:
+            s_pnl_vol = 40
+        elif pnl_vol_ratio < 0.05:
+            s_pnl_vol = 20
+        else:
+            s_pnl_vol = 0
+
+        # ── 指标 2: 交易频率得分 (0-100, 权重 25%) ──
+        # 用"头寸数/天"衡量决策频率，而非"交易笔数/天"
+        # 因为方向性交易者可能在一个头寸内分批建仓（大量交易笔数但决策少）
+        positions_count = len(all_reports)
+        decisions_per_day = positions_count / active_days
+        # 同时计算原始交易频率作为辅助指标
+        raw_trades_per_day = total_trade_count / active_days
+        
+        if decisions_per_day > 50:
+            s_freq = 100
+        elif decisions_per_day > 20:
+            s_freq = 80
+        elif decisions_per_day > 10:
+            s_freq = 60
+        elif decisions_per_day > 5:
+            s_freq = 40
+        elif decisions_per_day > 2:
+            s_freq = 20
+        else:
+            s_freq = 0
+
+        # ── 指标 3: 买卖平衡度得分 (0-100, 权重 20%) ──
+        if total_buy > 0 and total_sell > 0:
+            balance = min(total_buy, total_sell) / max(total_buy, total_sell)
+        elif total_buy == 0 and total_sell == 0:
+            balance = 0
+        else:
+            balance = 0  # 完全单边
+        if balance > 0.9:
+            s_balance = 100
+        elif balance > 0.7:
+            s_balance = 70
+        elif balance > 0.5:
+            s_balance = 40
+        elif balance > 0.3:
+            s_balance = 20
+        else:
+            s_balance = 0
+
+        # ── 指标 4: 平均持仓时间得分 (0-100, 权重 15%) ──
+        if avg_holding_hours < 1:
+            s_holding = 100
+        elif avg_holding_hours < 4:
+            s_holding = 80
+        elif avg_holding_hours < 12:
+            s_holding = 60
+        elif avg_holding_hours < 24:
+            s_holding = 40
+        elif avg_holding_hours < 72:
+            s_holding = 20
+        else:
+            s_holding = 0
+
+        # ── 指标 5: 金额均匀度得分 (0-100, 权重 10%) ──
+        if amount_cv < 0.3:
+            s_uniform = 100
+        elif amount_cv < 0.5:
+            s_uniform = 70
+        elif amount_cv < 0.8:
+            s_uniform = 40
+        elif amount_cv < 1.2:
+            s_uniform = 20
+        else:
+            s_uniform = 0
+
+        # ── 加权总分 ──
+        mm_score = (
+            s_pnl_vol * 0.30
+            + s_freq * 0.25
+            + s_balance * 0.20
+            + s_holding * 0.15
+            + s_uniform * 0.10
+        )
+
+        is_mm = mm_score > 50
+
+        if is_mm:
+            logger.info(
+                f"做市商检测 | MM Score: {mm_score:.1f} | "
+                f"PnL/Vol: {pnl_vol_ratio:.3%} | "
+                f"决策频率: {decisions_per_day:.1f}头寸/天 | "
+                f"买卖平衡: {balance:.2f} | "
+                f"持仓: {avg_holding_hours:.1f}h"
+            )
+
+        return {
+            "mm_score": round(mm_score, 1),
+            "is_market_maker": is_mm,
+            "indicators": {
+                "pnl_vol_ratio": round(pnl_vol_ratio, 6),
+                "decisions_per_day": round(decisions_per_day, 1),
+                "raw_trades_per_day": round(raw_trades_per_day, 1),
+                "buy_sell_balance": round(balance, 3),
+                "avg_holding_hours": round(avg_holding_hours, 1),
+                "trade_amount_cv": round(amount_cv, 3),
+                "total_positions": positions_count,
+                "total_trades": total_trade_count,
+                "total_buys": total_buy,
+                "total_sells": total_sell,
+                "active_days": active_days,
+            },
+            "scores": {
+                "pnl_vol": s_pnl_vol,
+                "frequency": s_freq,
+                "balance": s_balance,
+                "holding_time": s_holding,
+                "uniformity": s_uniform,
+            },
+        }
+
+    def detect_hft(self) -> dict:
+        """
+        高频交易检测。满足以下 3 条件中的 2 条 → HFT。
+
+        用"头寸数/天"（decisions_per_day）而不是"交易笔数/天"来衡量频率。
+        因为方向性交易者可能在一个头寸内分批建仓。
+
+        1. 决策频率 > 10 头寸/天（即每天开超过 10 个新头寸）
+        2. 中位数持仓时间 < 4 小时
+        3. 中位数单笔金额 < $50
+        """
+        all_reports = self._reports
+        closed = self._closed
+
+        # 活跃天数
+        all_first = [r.first_trade for r in all_reports if r.first_trade is not None]
+        all_last = [r.last_trade for r in all_reports if r.last_trade is not None]
+        active_days = max((max(all_last) - min(all_first)).days, 1) if all_first and all_last else 1
+
+        # 决策频率：用头寸数/天
+        positions_count = len(all_reports)
+        decisions_per_day = positions_count / active_days
+
+        # 原始交易频率（仅供参考）
+        total_trades = sum(r.trade_count for r in all_reports)
+        raw_trades_per_day = total_trades / active_days
+
+        # 持仓时间
+        valid_hours = [r.holding_hours for r in closed if r.holding_hours > 0]
+        median_holding = float(np.median(valid_hours)) if valid_hours else 0
+
+        # 中位数单笔金额
+        trade_amounts = [r.total_invested for r in all_reports if r.total_invested > 0]
+        median_amount = float(np.median(trade_amounts)) if trade_amounts else 0
+
+        # 条件判定
+        cond_freq = decisions_per_day > 10  # 每天超过 10 个新头寸
+        cond_holding = median_holding < 4
+        cond_amount = median_amount < 50
+
+        hits = sum([cond_freq, cond_holding, cond_amount])
+        is_hft = hits >= 2
+
+        if is_hft:
+            logger.info(
+                f"HFT 检测 | 决策频率: {decisions_per_day:.1f}头寸/天 ({cond_freq}) | "
+                f"持仓: {median_holding:.1f}h ({cond_holding}) | "
+                f"单笔: \${median_amount:.0f} ({cond_amount})"
+            )
+
+        return {
+            "is_hft": is_hft,
+            "hits": hits,
+            "conditions": {
+                "high_frequency": {"value": round(decisions_per_day, 1), "threshold": 10, "triggered": cond_freq, "note": "头寸数/天"},
+                "short_holding": {"value": round(median_holding, 1), "threshold": 4, "triggered": cond_holding},
+                "small_trades": {"value": round(median_amount, 2), "threshold": 50, "triggered": cond_amount, "note": "中位数头寸金额"},
+                "raw_trades_per_day": round(raw_trades_per_day, 1),  # 仅供调试参考
+            },
+        }
+
+    def assess_copy_reliability(self) -> dict:
+        """
+        综合评估跟单可靠性。
+
+        🟢 高可靠: 持仓 > 24h, 决策频率 < 2 头寸/天, PnL/Vol > 10%
+        🟡 中可靠: 持仓 4-24h, 决策频率 < 5 头寸/天
+        🔴 低可靠: 持仓 < 4h 或 决策频率 > 5 头寸/天
+        ❌ 不可跟单: MM Score > 50 或 HFT
+        """
+        mm = self.detect_market_maker()
+        hft = self.detect_hft()
+
+        mm_score = mm["mm_score"]
+        is_mm = mm["is_market_maker"]
+        is_hft = hft["is_hft"]
+
+        indicators = mm["indicators"]
+        avg_holding = indicators["avg_holding_hours"]
+        decisions_per_day = indicators["decisions_per_day"]
+        pnl_vol = indicators["pnl_vol_ratio"]
+
+        # 判定
+        if is_mm or is_hft:
+            level = "❌ 不可跟单"
+            reasons = []
+            if is_mm:
+                reasons.append(f"做市商 (MM Score {mm_score:.0f})")
+            if is_hft:
+                reasons.append(f"高频交易 ({decisions_per_day:.1f}头寸/天)")
+            reason = " + ".join(reasons)
+        elif avg_holding > 24 and decisions_per_day < 2 and pnl_vol > 0.10:
+            level = "🟢 高可靠"
+            reason = f"持仓{avg_holding:.0f}h, {decisions_per_day:.1f}头寸/天, PnL/Vol {pnl_vol:.1%}"
+        elif avg_holding >= 4 and decisions_per_day < 5:
+            level = "🟡 中可靠"
+            reason = f"持仓{avg_holding:.0f}h, {decisions_per_day:.1f}头寸/天"
+        else:
+            level = "🔴 低可靠"
+            reasons = []
+            if avg_holding < 4:
+                reasons.append(f"持仓仅{avg_holding:.1f}h")
+            if decisions_per_day >= 5:
+                reasons.append(f"决策频率{decisions_per_day:.1f}头寸/天")
+            reason = ", ".join(reasons) if reasons else "综合指标偏低"
+
+        return {
+            "copy_reliability": level,
+            "reason": reason,
+            "market_maker_analysis": mm,
+            "hft_analysis": hft,
+        }
+
     # ── 6. 跟单推荐指数（event 级六维评分） ────────────────
 
     def calculate_score(self) -> dict:
         """
         基于 event 级数据的八维评分 (0-100)。
         维度：胜率(20) + ROI稳定性(15) + Entry Edge(20) + 样本量(15) + 分散度(10) + 盈亏比(10) + 滑点惩罚 + 持仓时间惩罚
+        
+        TradeFox 适配:
+        - copy_delay_seconds: 跟单延迟 (默认 0.3s)
+        - 持仓时间惩罚大幅降低（0.3s 延迟可以跟上大多数持仓）
         """
         if not self._closed:
             return {"total": 0, "grade": "D", "breakdown": {},
@@ -1290,23 +1595,47 @@ class WalletAnalyzer:
         # PF >= 3.0 满分，PF <= 1.0 零分
         score_pf = max(0, min(1, (profit_factor - 1.0) / 2.0)) * 10
 
-        # ── 滑点惩罚 ──
+        # ── 滑点惩罚 (TradeFox 适配) ──
+        # 根据用户设置的 max_slippage_pct 和 min_market_liquidity 调整
         total_invested = sum(r.total_invested for r in closed)
-        slippage = -10 if total_invested > 1_000_000 else (-5 if total_invested > 100_000 else 0)
+        
+        # 只有大额投资才考虑滑点惩罚
+        if total_invested > 1_000_000:
+            if self._max_slippage < 0.5:
+                slippage = -5  # 低滑点容忍，非常谨慎
+            elif self._max_slippage < 1.0:
+                slippage = -8
+            else:
+                slippage = -10
+        elif total_invested > 100_000:
+            slippage = -3 if self._max_slippage < 1.0 else -5
+        else:
+            slippage = 0  # 小额投资滑点影响小
 
-        # ── 持仓时间惩罚 ──
-        # 做市商/高频地址不适合跟单，直接大幅扣分
+        # ── 持仓时间惩罚 (TradeFox 适配) ──
+        # 核心逻辑: 0.3s 延迟可以跟上绝大多数持仓
+        # 只有持仓时间 < 1小时 的才扣分
         behavior = self.analyze_behavior()
         holding_risk = behavior.get("holding_risk", {})
         hr_severity = holding_risk.get("severity", "low")
-        if hr_severity == "critical":
-            holding_penalty = -30  # 做市商嫌疑，直接扣 30 分
-        elif hr_severity == "high":
-            holding_penalty = -20  # 快进快出，扣 20 分
-        elif hr_severity == "medium":
-            holding_penalty = -10  # 短线交易者，扣 10 分
+        median_hours = holding_risk.get("median_hours", 0)
+        
+        # TradeFox 0.3s 延迟 vs 持仓时间
+        # 如果持仓 > 1 小时，延迟可以忽略
+        # 只有持仓 < 30 分钟的才需要惩罚
+        if median_hours < 0.5:  # < 30 分钟
+            if hr_severity == "critical":
+                holding_penalty = -10  # 从 -30 降到 -10
+            elif hr_severity == "high":
+                holding_penalty = -5   # 从 -20 降到 -5
+            elif hr_severity == "medium":
+                holding_penalty = -2   # 从 -10 降到 -2
+            else:
+                holding_penalty = 0
+        elif median_hours < 1:  # 30分钟 ~ 1小时
+            holding_penalty = -1 if hr_severity in ("high", "critical") else 0
         else:
-            holding_penalty = 0
+            holding_penalty = 0  # 持仓 > 1小时，0.3s 延迟可忽略
 
         total = round(score_wr + score_stability + score_edge + score_sample + score_div + score_pf + slippage + holding_penalty, 1)
         total = max(0, min(100, total))
@@ -1340,7 +1669,11 @@ class WalletAnalyzer:
                 "profit_factor": round(profit_factor, 2),
                 "holding_risk_label": holding_risk.get("label", "unknown"),
                 "holding_risk_severity": hr_severity,
-                "median_holding_hours": holding_risk.get("median_hours", 0),
+                "median_holding_hours": median_hours,
+                # TradeFox 参数
+                "tradefox_copy_delay_seconds": self._copy_delay,
+                "tradefox_min_liquidity": self._min_liquidity,
+                "tradefox_max_slippage_pct": self._max_slippage,
             },
             "risk_warnings": warnings,
         }
@@ -1489,6 +1822,7 @@ class WalletAnalyzer:
         # ── 后续字段 ──
         report["events"] = [{k: v for k, v in e.items() if k != "outcomes"} for e in events]
         report["copy_trading_score"] = self.calculate_score()
+        report["copy_reliability"] = self.assess_copy_reliability()
         report["validation"] = self.validate()
 
         # 高频预检信息

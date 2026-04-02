@@ -539,6 +539,235 @@ class PolymarketFetcher:
 
         return result
 
+    # ── 增量获取 ──────────────────────────────────────────
+
+    async def get_activity_since(self, address: str, since_timestamp: str) -> pd.DataFrame:
+        """
+        获取指定时间之后的 activity 记录
+        
+        Args:
+            address: 钱包地址
+            since_timestamp: ISO 8601 格式时间戳
+        
+        Returns:
+            DataFrame 包含新的 activity 记录
+        """
+        # 转换为 Unix 时间戳
+        since_dt = datetime.fromisoformat(since_timestamp.replace('Z', '+00:00'))
+        since_ts = int(since_dt.timestamp())
+        
+        logger.info(f"增量拉取 activity | since: {_ts_to_str(since_ts)}")
+        
+        # 使用现有的分页逻辑，但只保留时间戳 > since_ts 的记录
+        all_records: list[dict] = []
+        offset = 0
+        
+        while True:
+            params = {
+                "user": address,
+                "limit": PAGE_LIMIT,
+                "offset": offset,
+            }
+            
+            try:
+                data = await self._get(f"{DATA_API_BASE}/activity", params=params)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    break
+                raise
+            
+            batch = [d for d in data if isinstance(d, dict)]
+            if not batch:
+                break
+            
+            # 过滤：只保留时间戳 > since_ts 的记录
+            new_records = [r for r in batch if int(r.get("timestamp", 0)) > since_ts]
+            
+            if not new_records:
+                # 如果本批次没有新记录，说明已经到达时间边界
+                logger.debug(f"offset={offset} 无新记录，停止")
+                break
+            
+            all_records.extend(new_records)
+            logger.debug(f"offset={offset} | 本批 {len(batch)} 条, 新增 {len(new_records)} 条")
+            
+            # 如果本批次有记录但都是旧的，继续翻页
+            if len(new_records) < len(batch):
+                # 部分记录是旧的，说明接近边界，继续但可能很快结束
+                pass
+            
+            if len(batch) < PAGE_LIMIT:
+                break
+            
+            offset += PAGE_LIMIT
+            if offset >= OFFSET_CEILING:
+                logger.warning(f"增量拉取达到 offset 上限 {OFFSET_CEILING}")
+                break
+        
+        if not all_records:
+            logger.info("无新 activity 记录")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(all_records)
+        logger.info(f"增量拉取完成 | {len(df)} 条新记录")
+        return df
+
+    async def fetch_incremental(
+        self,
+        address: str,
+        cache_manager: "CacheManager",  # type: ignore
+    ) -> dict:
+        """
+        增量获取数据（如果缓存存在）或全量获取（首次）
+        
+        Args:
+            address: 钱包地址
+            cache_manager: 缓存管理器实例
+        
+        Returns:
+            {
+                "activity": DataFrame,
+                "closed_positions": DataFrame,
+                "positions": DataFrame,
+                "fetch_type": "full" | "incremental",
+                "stats": {
+                    "duration_seconds": float,
+                    "activity_new": int,
+                    "activity_cached": int,
+                    "api_calls": int,
+                }
+            }
+        """
+        from polycopilot.cache import CacheMetadata
+        
+        t0 = time.time()
+        meta = cache_manager.load_metadata(address)
+        
+        if meta is None:
+            # 首次：全量拉取
+            logger.info(f"首次分析 | 执行全量拉取: {address}")
+            data = await self.fetch_all(address)
+            
+            # 保存缓存
+            cache_data = {
+                "activity": data["activity"],
+                "closed_positions": data["closed_positions"],
+                "positions": data["positions"],
+            }
+            cache_manager.save_data(address, cache_data)
+            
+            # 创建元数据
+            now_iso = datetime.now(timezone.utc).isoformat()
+            activity_latest = ""
+            if not data["activity"].empty:
+                latest_ts = data["activity"]["timestamp"].astype(int).max()
+                activity_latest = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
+            
+            new_meta = CacheMetadata(
+                address=address,
+                first_fetch=now_iso,
+                last_fetch=now_iso,
+                activity_count=len(data["activity"]),
+                activity_latest_timestamp=activity_latest,
+                closed_count=len(data["closed_positions"]),
+                fetch_history=[{
+                    "time": now_iso,
+                    "type": "full",
+                    "activity_new": len(data["activity"]),
+                }],
+            )
+            cache_manager.save_metadata(address, new_meta)
+            
+            elapsed = time.time() - t0
+            return {
+                **data,
+                "fetch_type": "full",
+                "stats": {
+                    "duration_seconds": round(elapsed, 1),
+                    "activity_new": len(data["activity"]),
+                    "activity_cached": 0,
+                    "api_calls": self._req_count,
+                },
+            }
+        
+        # 增量拉取
+        logger.info(f"增量更新 | 上次: {meta.last_fetch}")
+        
+        # 验证缓存
+        is_valid, error = cache_manager.validate_cache(address)
+        if not is_valid:
+            logger.warning(f"缓存验证失败: {error}, 回退到全量拉取")
+            cache_manager.clear_cache(address)
+            return await self.fetch_incremental(address, cache_manager)
+        
+        # 加载缓存数据
+        cached_data = cache_manager.load_data(address)
+        
+        # 1. Activity: 增量拉取
+        new_activity = await self.get_activity_since(address, meta.activity_latest_timestamp)
+        
+        # 合并 activity
+        if not new_activity.empty:
+            merged_activity = pd.concat([cached_data["activity"], new_activity], ignore_index=True)
+            # 去重
+            merged_activity = merged_activity.drop_duplicates(
+                subset=["transactionHash", "timestamp", "type"],
+                keep="first"
+            )
+        else:
+            merged_activity = cached_data["activity"]
+        
+        # 2. Closed positions: 全量拉取，diff 找新增
+        closed = await self.get_closed_positions(address)
+        
+        # 3. Positions: 全量覆盖
+        positions = await self.get_positions(address)
+        
+        # 保存更新后的缓存
+        updated_data = {
+            "activity": merged_activity,
+            "closed_positions": closed,
+            "positions": positions,
+        }
+        cache_manager.save_data(address, updated_data)
+        
+        # 更新元数据
+        now_iso = datetime.now(timezone.utc).isoformat()
+        activity_latest = meta.activity_latest_timestamp
+        if not merged_activity.empty:
+            latest_ts = merged_activity["timestamp"].astype(int).max()
+            activity_latest = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
+        
+        meta.last_fetch = now_iso
+        meta.activity_count = len(merged_activity)
+        meta.activity_latest_timestamp = activity_latest
+        meta.closed_count = len(closed)
+        meta.fetch_history.append({
+            "time": now_iso,
+            "type": "incremental",
+            "activity_new": len(new_activity),
+        })
+        cache_manager.save_metadata(address, meta)
+        
+        elapsed = time.time() - t0
+        logger.info(
+            f"增量更新完成 | 新增 {len(new_activity)} 条 activity, "
+            f"总计 {len(merged_activity)} 条, 耗时 {elapsed:.1f}s"
+        )
+        
+        return {
+            "activity": merged_activity,
+            "closed_positions": closed,
+            "positions": positions,
+            "fetch_type": "incremental",
+            "stats": {
+                "duration_seconds": round(elapsed, 1),
+                "activity_new": len(new_activity),
+                "activity_cached": len(cached_data["activity"]),
+                "api_calls": self._req_count,
+            },
+        }
+
 
 # ── 模块直接运行时的简单验证 ─────────────────────────────
 
