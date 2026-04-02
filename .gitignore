@@ -1,23 +1,28 @@
-# Data files (may contain wallet addresses and trade details)
+# Runtime data / cached outputs
 data/*.json
 data/*.parquet
+data/cache/
+polycopilot/data/
+discovery.log
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
 
-# IDE
+# IDE / agent tool state
 .cursor/
 .vscode/
 .idea/
 *.swp
 *.swo
+.claude/
 
 # OS
 .DS_Store
